@@ -959,13 +959,15 @@ process_attestations_for_checkpoint() {
     if [[ "$signers_status" == "decoded" ]]; then
       if [[ -n "${signer_set[$address]:-}" ]]; then
         status="completed"
-        tg_send_once "attestation-completed" "${checkpoint}:${address}" "$(join_lines \
-          "Attestation completed" \
-          "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
-          "$(html_field_line "epoch" "$epoch")" \
-          "$(html_field_line "checkpoint" "$checkpoint")" \
-          "$(html_field_line_html "tx" "$(tx_hash_html "$tx_hash")")"
-        )" || true
+        if is_true "$AZMON_DUTY_INFO"; then
+          tg_send_once "attestation-completed" "${checkpoint}:${address}" "$(join_lines \
+            "Attestation completed" \
+            "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
+            "$(html_field_line "epoch" "$epoch")" \
+            "$(html_field_line "checkpoint" "$checkpoint")" \
+            "$(html_field_line_html "tx" "$(tx_hash_html "$tx_hash")")"
+          )" || true
+        fi
       else
         # Proposal calldata only carries the attestations needed for quorum.
         status="not-included"
@@ -1142,14 +1144,16 @@ process_checkpoint_proposed_log() {
   if [[ -n "${MONITORED_SET[$proposer]:-}" ]]; then
     ensure_proposer_duty "$epoch" "$slot" "$slot_time" "$proposer"
     mark_proposer_status "$slot" "$proposer" "completed" "$checkpoint" "$tx_hash"
-    tg_send_once "proposal-completed" "${slot}:${proposer}" "$(join_lines \
-      "Proposal completed" \
-      "$(html_field_line_html "sequencer" "$(address_label_html "$proposer")")" \
-      "$(html_field_line "epoch" "$epoch")" \
-      "$(html_field_line "slot" "$slot")" \
-      "$(html_field_line "checkpoint" "$checkpoint")" \
-      "$(html_field_line_html "tx" "$(tx_hash_html "$tx_hash")")"
-    )" || true
+    if is_true "$AZMON_DUTY_INFO"; then
+      tg_send_once "proposal-completed" "${slot}:${proposer}" "$(join_lines \
+        "Proposal completed" \
+        "$(html_field_line_html "sequencer" "$(address_label_html "$proposer")")" \
+        "$(html_field_line "epoch" "$epoch")" \
+        "$(html_field_line "slot" "$slot")" \
+        "$(html_field_line "checkpoint" "$checkpoint")" \
+        "$(html_field_line_html "tx" "$(tx_hash_html "$tx_hash")")"
+      )" || true
+    fi
   fi
 
   try_decode_checkpoint_signers "$checkpoint" "$epoch" "$tx_hash" "$slot" "$slot_time" "$proposer" || true

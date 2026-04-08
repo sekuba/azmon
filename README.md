@@ -43,5 +43,5 @@ State is stored under `AZMON_STATE_DIR` and includes:
 
 - attestation completion is verified from nested rollup `propose(...)` calldata found via `debug_traceTransaction(..., {"tracer":"callTracer"})`
 - attestation non-inclusion in an individual proposal is tracked but not alerted as a miss; an attestation miss is only alerted when a sequencer has zero included attestations across the entire duty epoch
-- `AZMON_DUTY_INFO=true` enables duty discovery messages and end-of-epoch attestation stats
+- `AZMON_DUTY_INFO=true` enables full duty lifecycle info, including duty discovery, successful proposal/attestation completions, and end-of-epoch attestation stats
 - if tracing fails, attestation status is kept as `unknown` and retried on later polls
