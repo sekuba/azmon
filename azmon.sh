@@ -12,6 +12,19 @@ declare -a MONITORED_ADDRESSES=()
 declare -A MONITORED_SET=()
 declare -A SEQUENCER_LABELS=()
 declare -A LOG_ALERT_LEVELS=()
+readonly -a REQUIRED_COMMANDS=(docker curl jq cast sha256sum)
+readonly -a REQUIRED_ENV_VARS=(
+  AZMON_TELEGRAM_BOT_TOKEN
+  AZMON_TELEGRAM_CHAT_ID
+  AZMON_MONITORED_SEQUENCERS
+)
+readonly -a UINT_ENV_VARS=(
+  AZMON_POLL_INTERVAL_SEC
+  AZMON_LOG_LOOKBACK_SEC
+  AZMON_PROPOSAL_GRACE_SEC
+  AZMON_BLOCK_CONFIRMATIONS
+  AZMON_ALERT_COOLDOWN_SEC
+)
 
 load_dotenv_defaults() {
   local dotenv_file="$1"
@@ -50,7 +63,6 @@ AZMON_PROPOSAL_GRACE_SEC="${AZMON_PROPOSAL_GRACE_SEC:-120}"
 AZMON_BLOCK_CONFIRMATIONS="${AZMON_BLOCK_CONFIRMATIONS:-2}"
 AZMON_ALERT_COOLDOWN_SEC="${AZMON_ALERT_COOLDOWN_SEC:-900}"
 AZMON_DRY_RUN="${AZMON_DRY_RUN:-false}"
-AZMON_DEBUG="${AZMON_DEBUG:-false}"
 AZMON_TELEGRAM_THREAD_ID="${AZMON_TELEGRAM_THREAD_ID:-}"
 AZMON_SEQUENCER_LABELS="${AZMON_SEQUENCER_LABELS:-}"
 AZMON_LOG_INCLUDE_REGEX="${AZMON_LOG_INCLUDE_REGEX:-}"
@@ -66,18 +78,8 @@ log_line() {
   printf '%s [%s] %s\n' "$(log_ts)" "$level" "$*" >&2
 }
 
-log_debug() {
-  if is_true "$AZMON_DEBUG"; then
-    log_line DEBUG "$@"
-  fi
-}
-
 log_info() {
   log_line INFO "$@"
-}
-
-log_warn() {
-  log_line WARN "$@"
 }
 
 log_error() {
@@ -288,6 +290,13 @@ tg_send_once() {
   return 1
 }
 
+alert_once() {
+  local category="$1"
+  local unique_key="$2"
+  shift 2
+  tg_send_once "$category" "$unique_key" "$(join_lines "$@")" || true
+}
+
 notify_runtime_error() {
   local key="$1"
   local message="$2"
@@ -307,35 +316,22 @@ notify_runtime_error() {
   fi
 
   log_error "$log_message"
-  tg_send_once "runtime-error" "$key" "$(join_lines "${lines[@]}")" || true
+  alert_once "runtime-error" "$key" "${lines[@]}"
 }
 
 notify_container_unhealthy() {
   local detail="$1"
   log_error "$detail"
-  tg_send_once "container-unhealthy" "$AZMON_DOCKER_CONTAINER" "$(join_lines \
+  alert_once "container-unhealthy" "$AZMON_DOCKER_CONTAINER" \
     "Container unhealthy" \
     "$(html_field_line "container" "$AZMON_DOCKER_CONTAINER")" \
     "$(html_field_line "detail" "$detail")"
-  )" || true
 }
 
 rpc_call() {
   local method="$1"
-  shift
-  cast rpc --rpc-url "$AZMON_RPC_URL" "$method" "$@"
-}
-
-rpc_call_raw() {
-  local method="$1"
   local params="$2"
   cast rpc --rpc-url "$AZMON_RPC_URL" "$method" --raw "$params"
-}
-
-cast_call() {
-  local signature="$1"
-  shift
-  cast call --json --rpc-url "$AZMON_RPC_URL" "$AZMON_ROLLUP_ADDRESS" "$signature" "$@" | jq -r '.[0]'
 }
 
 cast_logs() {
@@ -347,7 +343,7 @@ cast_logs() {
 
 trace_tx() {
   local tx_hash="$1"
-  rpc_call_raw "debug_traceTransaction" "[\"$tx_hash\", {\"tracer\":\"callTracer\"}]"
+  rpc_call "debug_traceTransaction" "[\"$tx_hash\", {\"tracer\":\"callTracer\"}]"
 }
 
 address_label() {
@@ -405,7 +401,7 @@ rollup_eth_call() {
   shift
   calldata="$(cast calldata "$signature" "$@")"
   params="$(printf '[{"to":"%s","data":"%s"},"latest"]' "$AZMON_ROLLUP_ADDRESS" "$calldata")"
-  output="$(rpc_call_raw "eth_call" "$params")"
+  output="$(rpc_call "eth_call" "$params")"
   jq -r '.' <<<"$output"
 }
 
@@ -436,10 +432,6 @@ decode_checkpoint_slot_output() {
 
 get_current_epoch() {
   decode_uint256_output "$(rollup_eth_call 'getCurrentEpoch()')"
-}
-
-get_genesis_time() {
-  decode_uint256_output "$(rollup_eth_call 'getGenesisTime()')"
 }
 
 get_slot_duration() {
@@ -563,23 +555,21 @@ ensure_state_layout() {
 }
 
 validate_env() {
-  [[ -n "${AZMON_TELEGRAM_BOT_TOKEN:-}" ]] || die "AZMON_TELEGRAM_BOT_TOKEN is required"
-  [[ -n "${AZMON_TELEGRAM_CHAT_ID:-}" ]] || die "AZMON_TELEGRAM_CHAT_ID is required"
-  [[ -n "${AZMON_MONITORED_SEQUENCERS:-}" ]] || die "AZMON_MONITORED_SEQUENCERS is required"
+  local name
+  for name in "${REQUIRED_ENV_VARS[@]}"; do
+    [[ -n "${!name:-}" ]] || die "$name is required"
+  done
 
-  require_uint "AZMON_POLL_INTERVAL_SEC" "$AZMON_POLL_INTERVAL_SEC"
-  require_uint "AZMON_LOG_LOOKBACK_SEC" "$AZMON_LOG_LOOKBACK_SEC"
-  require_uint "AZMON_PROPOSAL_GRACE_SEC" "$AZMON_PROPOSAL_GRACE_SEC"
-  require_uint "AZMON_BLOCK_CONFIRMATIONS" "$AZMON_BLOCK_CONFIRMATIONS"
-  require_uint "AZMON_ALERT_COOLDOWN_SEC" "$AZMON_ALERT_COOLDOWN_SEC"
+  for name in "${UINT_ENV_VARS[@]}"; do
+    require_uint "$name" "${!name}"
+  done
 }
 
 check_dependencies() {
-  require_cmd docker
-  require_cmd curl
-  require_cmd jq
-  require_cmd cast
-  require_cmd sha256sum
+  local cmd
+  for cmd in "${REQUIRED_COMMANDS[@]}"; do
+    require_cmd "$cmd"
+  done
 }
 
 load_runtime_config() {
@@ -641,14 +631,13 @@ ensure_attester_duty() {
     --argjson discovered_at "$discovered_at"
 
   if (( ! already_exists )) && is_true "$AZMON_DUTY_INFO"; then
-    tg_send_once "duty-info" "$key" "$(join_lines \
+    alert_once "duty-info" "$key" \
       "Duty info" \
       "$(html_field_line "kind" "attester")" \
       "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
       "$(html_field_line "epoch" "$epoch")" \
       "$(html_field_line "epoch_start" "$(format_utc "$start_time")")" \
       "$(html_field_line "epoch_end" "$(format_utc "$end_time")")"
-    )" || true
   fi
 }
 
@@ -676,14 +665,13 @@ ensure_proposer_duty() {
     --argjson discovered_at "$discovered_at"
 
   if is_true "$AZMON_DUTY_INFO"; then
-    tg_send_once "duty-info" "$key" "$(join_lines \
+    alert_once "duty-info" "$key" \
       "Duty info" \
       "$(html_field_line "kind" "proposer")" \
       "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
       "$(html_field_line "epoch" "$epoch")" \
       "$(html_field_line "slot" "$slot")" \
       "$(html_field_line "slot_time" "$(format_utc "$slot_time")")"
-    )" || true
   fi
 }
 
@@ -771,12 +759,11 @@ poll_docker_logs() {
     fi
 
     line_key="$(hash_text "${severity}|${app_line}")"
-    tg_send_once "log" "$line_key" "$(join_lines \
+    alert_once "log" "$line_key" \
       "Log alert" \
       "$(html_field_line "severity" "$severity")" \
       "$(html_field_line "container" "$AZMON_DOCKER_CONTAINER")" \
       "$(html_field_line "line" "$app_line")"
-    )" || true
   done <<<"$logs_output"
 
   if [[ -n "$last_ts" ]]; then
@@ -960,13 +947,12 @@ process_attestations_for_checkpoint() {
       if [[ -n "${signer_set[$address]:-}" ]]; then
         status="completed"
         if is_true "$AZMON_DUTY_INFO"; then
-          tg_send_once "attestation-completed" "${checkpoint}:${address}" "$(join_lines \
+          alert_once "attestation-completed" "${checkpoint}:${address}" \
             "Attestation completed" \
             "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
             "$(html_field_line "epoch" "$epoch")" \
             "$(html_field_line "checkpoint" "$checkpoint")" \
             "$(html_field_line_html "tx" "$(tx_hash_html "$tx_hash")")"
-          )" || true
         fi
       else
         # Proposal calldata only carries the attestations needed for quorum.
@@ -1061,22 +1047,20 @@ check_attester_epoch_results() {
     mark_attester_epoch_result "$epoch" "$address" "$observed" "$included" "$not_included" "$unknown"
 
     if (( included == 0 )); then
-      tg_send_once "attestation-missed-epoch" "${epoch}:${address}" "$(join_lines \
+      alert_once "attestation-missed-epoch" "${epoch}:${address}" \
         "Attestation missed" \
         "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
         "$(html_field_line "epoch" "$epoch")" \
         "$(html_field_line "attested" "$included/$observed")"
-      )" || true
     fi
 
     if is_true "$AZMON_DUTY_INFO"; then
-      tg_send_once "attestation-stats" "${epoch}:${address}" "$(join_lines \
+      alert_once "attestation-stats" "${epoch}:${address}" \
         "Attestation stats" \
         "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
         "$(html_field_line "epoch" "$epoch")" \
         "$(html_field_line "attested" "$included/$observed")" \
         "$(html_field_line "not_included" "$not_included")"
-      )" || true
     fi
   done < <(json_get "duty_cache.json" 'to_entries[] | select(.value.type == "attester")')
 }
@@ -1145,14 +1129,13 @@ process_checkpoint_proposed_log() {
     ensure_proposer_duty "$epoch" "$slot" "$slot_time" "$proposer"
     mark_proposer_status "$slot" "$proposer" "completed" "$checkpoint" "$tx_hash"
     if is_true "$AZMON_DUTY_INFO"; then
-      tg_send_once "proposal-completed" "${slot}:${proposer}" "$(join_lines \
+      alert_once "proposal-completed" "${slot}:${proposer}" \
         "Proposal completed" \
         "$(html_field_line_html "sequencer" "$(address_label_html "$proposer")")" \
         "$(html_field_line "epoch" "$epoch")" \
         "$(html_field_line "slot" "$slot")" \
         "$(html_field_line "checkpoint" "$checkpoint")" \
         "$(html_field_line_html "tx" "$(tx_hash_html "$tx_hash")")"
-      )" || true
     fi
   fi
 
@@ -1193,17 +1176,15 @@ process_checkpoint_invalidated_log() {
 
   if [[ -n "$slot" && -n "$proposer" ]]; then
     mark_proposer_status "$slot" "$proposer" "scheduled" "" ""
-    tg_send_once "runtime-error" "checkpoint-invalidated:${checkpoint}" "$(join_lines \
+    alert_once "runtime-error" "checkpoint-invalidated:${checkpoint}" \
       "Checkpoint invalidated" \
       "$(html_field_line "checkpoint" "$checkpoint")" \
       "$(html_field_line "slot" "$slot")" \
       "$(html_field_line_html "sequencer" "$(address_label_html "$proposer")")"
-    )" || true
   else
-    tg_send_once "runtime-error" "checkpoint-invalidated:${checkpoint}" "$(join_lines \
+    alert_once "runtime-error" "checkpoint-invalidated:${checkpoint}" \
       "Checkpoint invalidated" \
       "$(html_field_line "checkpoint" "$checkpoint")"
-    )" || true
   fi
 }
 
@@ -1242,12 +1223,11 @@ check_for_missed_proposals() {
     fi
 
     mark_proposer_status "$slot" "$address" "missed" "" ""
-    tg_send_once "proposal-missed" "${slot}:${address}" "$(join_lines \
+    alert_once "proposal-missed" "${slot}:${address}" \
       "Proposal missed" \
       "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
       "$(html_field_line "slot" "$slot")" \
       "$(html_field_line "slot_time" "$(format_utc "$slot_time")")"
-    )" || true
   done < <(json_get "duty_cache.json" 'to_entries[] | select(.value.type == "proposer")')
 }
 
