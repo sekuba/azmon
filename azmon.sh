@@ -180,6 +180,10 @@ state_file() {
   printf '%s/%s\n' "$AZMON_STATE_DIR" "$1"
 }
 
+proposer_duty_key() {
+  printf 'proposer:%s\n' "$1"
+}
+
 state_get() {
   local file
   file="$(state_file "$1")"
@@ -462,7 +466,7 @@ get_epoch_committee() {
   decode_address_array_output "$(rollup_eth_call 'getEpochCommittee(uint256)' "$1")"
 }
 
-get_proposer_at() {
+get_proposer_at_time() {
   decode_address_output "$(rollup_eth_call 'getProposerAt(uint256)' "$1")"
 }
 
@@ -488,12 +492,15 @@ find_nested_rollup_propose_input() {
 
 monitored_for_epoch() {
   local epoch="$1"
-  local member
+  local committee_members member
+  if ! committee_members="$(get_epoch_committee "$epoch")"; then
+    return 1
+  fi
   while IFS= read -r member; do
     if [[ -n "${MONITORED_SET[$member]:-}" ]]; then
       printf '%s\n' "$member"
     fi
-  done < <(get_epoch_committee "$epoch")
+  done <<<"$committee_members"
 }
 
 json_array_from_lines() {
@@ -647,7 +654,7 @@ ensure_proposer_duty() {
   local slot_time="$3"
   local address="$4"
   local key discovered_at label
-  key="proposer:${slot}:${address}"
+  key="$(proposer_duty_key "$slot")"
   if json_has "duty_cache.json" "$key"; then
     return 0
   fi
@@ -677,16 +684,11 @@ ensure_proposer_duty() {
 
 mark_proposer_status() {
   local slot="$1"
-  local address="$2"
-  local status="$3"
-  local checkpoint="$4"
-  local tx_hash="$5"
+  local status="$2"
+  local checkpoint="$3"
+  local tx_hash="$4"
   local key
-  key="proposer:${slot}:${address}"
-  if ! json_has "duty_cache.json" "$key"; then
-    return 0
-  fi
-
+  key="$(proposer_duty_key "$slot")"
   json_put "duty_cache.json" \
     'if has($key) then .[$key].status = $status | .[$key].checkpoint = $checkpoint | .[$key].tx_hash = $tx_hash | .[$key].updated_at = $now else . end' \
     --arg key "$key" \
@@ -716,7 +718,7 @@ poll_docker_logs() {
   local since cursor logs_output logs_error tmp_out tmp_err
   local line ts app_line severity last_ts next_cursor line_key
 
-  cursor="$(state_get "docker_cursor.txt" || true)"
+  cursor="$(state_get "docker_cursor.txt")"
   if [[ -n "$cursor" ]]; then
     since="$cursor"
   else
@@ -779,7 +781,7 @@ poll_docker_logs() {
 poll_upcoming_duties() {
   local current_epoch validator_lag randao_lag epoch_duration slot_duration stable_epoch_limit min_lag
   local epoch slot_start slot_end epoch_start_time epoch_end_time slot slot_time proposer
-  local address
+  local address epoch_members
 
   if ! current_epoch="$(get_current_epoch 2>/dev/null)"; then
     notify_runtime_error "getCurrentEpoch" "failed to fetch current epoch"
@@ -818,10 +820,15 @@ poll_upcoming_duties() {
     fi
     epoch_end_time=$(( epoch_start_time + (epoch_duration * slot_duration) - 1 ))
 
+    if ! epoch_members="$(monitored_for_epoch "$epoch" 2>/dev/null)"; then
+      notify_runtime_error "getEpochCommittee" "failed to fetch committee for epoch $epoch"
+      return 1
+    fi
+
     while IFS= read -r address; do
       [[ -n "$address" ]] || continue
       ensure_attester_duty "$epoch" "$address" "$slot_start" "$slot_end" "$epoch_start_time" "$epoch_end_time"
-    done < <(monitored_for_epoch "$epoch" 2>/dev/null || true)
+    done <<<"$epoch_members"
 
     for ((slot = slot_start; slot <= slot_end; slot++)); do
       if ! slot_time="$(get_timestamp_for_slot "$slot" 2>/dev/null)"; then
@@ -831,7 +838,7 @@ poll_upcoming_duties() {
       if (( slot_time < $(now_epoch) )); then
         continue
       fi
-      if ! proposer="$(get_proposer_at "$slot_time" 2>/dev/null)"; then
+      if ! proposer="$(get_proposer_at_time "$slot_time" 2>/dev/null)"; then
         notify_runtime_error "getProposerAt" "failed to fetch proposer for slot $slot"
         return 1
       fi
@@ -932,13 +939,18 @@ process_attestations_for_checkpoint() {
   local signers_status="$4"
   local signers_json="$5"
   local -A signer_set=()
-  local address status
+  local address status epoch_members
 
   if [[ "$signers_status" == "decoded" ]]; then
     while IFS= read -r address; do
       [[ -n "$address" ]] || continue
       signer_set["$address"]=1
     done < <(jq -r '.[]' <<<"$signers_json")
+  fi
+
+  if ! epoch_members="$(monitored_for_epoch "$epoch" 2>/dev/null)"; then
+    notify_runtime_error "getEpochCommittee" "failed to fetch committee for epoch $epoch"
+    return 1
   fi
 
   while IFS= read -r address; do
@@ -962,7 +974,7 @@ process_attestations_for_checkpoint() {
       status="unknown"
     fi
     record_attestation_result "$checkpoint" "$epoch" "$address" "$status" "$tx_hash"
-  done < <(monitored_for_epoch "$epoch" 2>/dev/null || true)
+  done <<<"$epoch_members"
 }
 
 mark_attester_epoch_result() {
@@ -1072,13 +1084,13 @@ try_decode_checkpoint_signers() {
   local slot="$4"
   local slot_time="$5"
   local proposer="$6"
-  local trace_json propose_input signers_json
+  local trace_json propose_input propose_signers signers_json
   local -a signers=()
 
   if ! trace_json="$(trace_tx "$tx_hash" 2>/dev/null)"; then
     notify_runtime_error "debug_traceTransaction" "trace failed" "$tx_hash"
     record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
-    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]'
+    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]' || return 1
     return 1
   fi
 
@@ -1086,18 +1098,28 @@ try_decode_checkpoint_signers() {
   if [[ -z "$propose_input" ]]; then
     notify_runtime_error "decode_rollup_propose_signers" "nested propose call not found in trace" "$tx_hash"
     record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
-    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]'
+    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]' || return 1
+    return 1
+  fi
+
+  if ! propose_signers="$(decode_rollup_propose_signers "$propose_input" 2>/dev/null)"; then
+    notify_runtime_error "decode_rollup_propose_signers" "failed to decode propose calldata" "$tx_hash"
+    record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
+    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]' || return 1
     return 1
   fi
 
   while IFS= read -r address; do
     [[ -n "$address" ]] || continue
     signers+=("$address")
-  done < <(decode_rollup_propose_signers "$propose_input" 2>/dev/null || true)
+  done <<<"$propose_signers"
 
   signers_json="$(json_array_from_lines "${signers[@]}")"
   record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "decoded" "$signers_json"
-  process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "decoded" "$signers_json"
+  if ! process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "decoded" "$signers_json"; then
+    record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
+    return 1
+  fi
 }
 
 process_checkpoint_proposed_log() {
@@ -1120,14 +1142,14 @@ process_checkpoint_proposed_log() {
     notify_runtime_error "getEpochAtSlot" "failed to fetch epoch for slot $slot"
     return 1
   fi
-  if ! proposer="$(get_proposer_at "$slot_time" 2>/dev/null)"; then
+  if ! proposer="$(get_proposer_at_time "$slot_time" 2>/dev/null)"; then
     notify_runtime_error "getProposerAt" "failed to fetch proposer for slot $slot"
     return 1
   fi
 
   if [[ -n "${MONITORED_SET[$proposer]:-}" ]]; then
     ensure_proposer_duty "$epoch" "$slot" "$slot_time" "$proposer"
-    mark_proposer_status "$slot" "$proposer" "completed" "$checkpoint" "$tx_hash"
+    mark_proposer_status "$slot" "completed" "$checkpoint" "$tx_hash"
     if is_true "$AZMON_DUTY_INFO"; then
       alert_once "proposal-completed" "${slot}:${proposer}" \
         "Proposal completed" \
@@ -1175,7 +1197,7 @@ process_checkpoint_invalidated_log() {
     --argjson now "$(now_epoch)"
 
   if [[ -n "$slot" && -n "$proposer" ]]; then
-    mark_proposer_status "$slot" "$proposer" "scheduled" "" ""
+    mark_proposer_status "$slot" "scheduled" "" ""
     alert_once "runtime-error" "checkpoint-invalidated:${checkpoint}" \
       "Checkpoint invalidated" \
       "$(html_field_line "checkpoint" "$checkpoint")" \
@@ -1211,7 +1233,7 @@ check_for_missed_proposals() {
     address="$(jq -r '.value.address' <<<"$entry")"
     status="$(jq -r '.value.status' <<<"$entry")"
 
-    if [[ "$status" == "completed" ]]; then
+    if [[ "$status" == "completed" || "$status" == "missed" ]]; then
       continue
     fi
     checkpoint="$(json_get "completion_cache.json" '.[$key] | select(.invalidated != true) | .checkpoint // empty' --arg key "proposal-slot:$slot")"
@@ -1222,8 +1244,8 @@ check_for_missed_proposals() {
       continue
     fi
 
-    mark_proposer_status "$slot" "$address" "missed" "" ""
-    alert_once "proposal-missed" "${slot}:${address}" \
+    mark_proposer_status "$slot" "missed" "" ""
+    alert_once "proposal-missed" "$slot" \
       "Proposal missed" \
       "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
       "$(html_field_line "slot" "$slot")" \
@@ -1244,7 +1266,7 @@ poll_l1_completions() {
   fi
   confirmed_block=$(( latest_block - AZMON_BLOCK_CONFIRMATIONS ))
 
-  cursor="$(state_get "l1_block_cursor.txt" || true)"
+  cursor="$(state_get "l1_block_cursor.txt")"
   if [[ -z "$cursor" ]]; then
     state_put "l1_block_cursor.txt" "$confirmed_block"
     runtime_mark "last_l1_poll"
