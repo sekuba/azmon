@@ -1060,10 +1060,10 @@ check_attester_epoch_results() {
 
     if (( included == 0 )); then
       alert_once "attestation-missed-epoch" "${epoch}:${address}" \
-        "Attestation missed" \
+        "Attestations not included" \
         "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
         "$(html_field_line "epoch" "$epoch")" \
-        "$(html_field_line "attested" "$included/$observed")"
+        "$(html_field_line "included" "$included/$observed")"
     fi
 
     if is_true "$AZMON_DUTY_INFO"; then
@@ -1071,7 +1071,7 @@ check_attester_epoch_results() {
         "Attestation stats" \
         "$(html_field_line_html "sequencer" "$(address_label_html "$address")")" \
         "$(html_field_line "epoch" "$epoch")" \
-        "$(html_field_line "attested" "$included/$observed")" \
+        "$(html_field_line "included" "$included/$observed")" \
         "$(html_field_line "not_included" "$not_included")"
     fi
   done < <(json_get "duty_cache.json" 'to_entries[] | select(.value.type == "attester")')
