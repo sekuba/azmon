@@ -715,7 +715,7 @@ poll_container_health() {
 }
 
 poll_docker_logs() {
-  local since cursor logs_output logs_error tmp_out tmp_err
+  local since cursor logs_output logs_error tmp_logs
   local line ts app_line severity last_ts next_cursor line_key
 
   cursor="$(state_get "docker_cursor.txt")"
@@ -725,17 +725,18 @@ poll_docker_logs() {
     since="${AZMON_LOG_LOOKBACK_SEC}s"
   fi
 
-  tmp_out="$(mktemp "$AZMON_STATE_DIR/.docker-logs.XXXXXX")"
-  tmp_err="$(mktemp "$AZMON_STATE_DIR/.docker-logs.XXXXXX")"
-  if ! docker logs --timestamps --since "$since" "$AZMON_DOCKER_CONTAINER" >"$tmp_out" 2>"$tmp_err"; then
-    logs_error="$(<"$tmp_err")"
-    rm -f "$tmp_out" "$tmp_err"
+  tmp_logs="$(mktemp "$AZMON_STATE_DIR/.docker-logs.XXXXXX")"
+  # Some containers emit structured application logs on stderr while still exiting successfully.
+  # Poll the merged stream so warn/error lines are not discarded on the success path.
+  if ! docker logs --timestamps --since "$since" "$AZMON_DOCKER_CONTAINER" >"$tmp_logs" 2>&1; then
+    logs_error="$(<"$tmp_logs")"
+    rm -f "$tmp_logs"
     notify_container_unhealthy "docker logs failed: ${logs_error:-unknown error}"
     return 1
   fi
 
-  logs_output="$(<"$tmp_out")"
-  rm -f "$tmp_out" "$tmp_err"
+  logs_output="$(<"$tmp_logs")"
+  rm -f "$tmp_logs"
   last_ts=""
 
   while IFS= read -r line; do
@@ -774,7 +775,6 @@ poll_docker_logs() {
     next_cursor="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     state_put "docker_cursor.txt" "$next_cursor"
   fi
-
   runtime_mark "last_docker_log_poll"
 }
 
