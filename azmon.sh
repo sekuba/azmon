@@ -305,7 +305,7 @@ notify_runtime_error() {
   local key="$1"
   local message="$2"
   local tx_hash="${3:-}"
-  local log_message
+  local log_message unique_key
   local -a lines=(
     "Runtime error"
     "$(html_field_line "component" "$key")"
@@ -314,19 +314,21 @@ notify_runtime_error() {
 
   if [[ -n "$tx_hash" ]]; then
     log_message="$message for tx $tx_hash"
+    unique_key="${key}:${message}:${tx_hash}"
     lines+=("$(html_field_line_html "tx" "$(tx_hash_html "$tx_hash")")")
   else
     log_message="$message"
+    unique_key="${key}:${message}"
   fi
 
   log_error "$log_message"
-  alert_once "runtime-error" "$key" "${lines[@]}"
+  alert_once "runtime-error" "$unique_key" "${lines[@]}"
 }
 
 notify_container_unhealthy() {
   local detail="$1"
   log_error "$detail"
-  alert_once "container-unhealthy" "$AZMON_DOCKER_CONTAINER" \
+  alert_once "container-unhealthy" "${AZMON_DOCKER_CONTAINER}:${detail}" \
     "Container unhealthy" \
     "$(html_field_line "container" "$AZMON_DOCKER_CONTAINER")" \
     "$(html_field_line "detail" "$detail")"
@@ -596,37 +598,24 @@ ensure_attester_duty() {
   local end_slot="$4"
   local start_time="$5"
   local end_time="$6"
-  local key discovered_at label already_exists=0
+  local key discovered_at label
   key="attester:${epoch}:${address}"
-  if json_has "duty_cache.json" "$key"; then
-    already_exists=1
-  fi
+  json_has "duty_cache.json" "$key" && return 0
 
   discovered_at="$(now_epoch)"
   label="$(address_label "$address")"
   json_put "duty_cache.json" \
-    'if has($key) then
-       .[$key].type = "attester" |
-       .[$key].epoch = $epoch |
-       .[$key].start_slot = $start_slot |
-       .[$key].end_slot = $end_slot |
-       .[$key].start_time = $start_time |
-       .[$key].end_time = $end_time |
-       .[$key].address = $address |
-       .[$key].label = $label
-     else
-       .[$key] = {
-         type:"attester",
-         epoch:$epoch,
-         start_slot:$start_slot,
-         end_slot:$end_slot,
-         start_time:$start_time,
-         end_time:$end_time,
-         address:$address,
-         label:$label,
-         discovered_at:$discovered_at
-       }
-     end' \
+    '.[$key] = {
+      type:"attester",
+      epoch:$epoch,
+      start_slot:$start_slot,
+      end_slot:$end_slot,
+      start_time:$start_time,
+      end_time:$end_time,
+      address:$address,
+      label:$label,
+      discovered_at:$discovered_at
+    }' \
     --arg key "$key" \
     --argjson epoch "$epoch" \
     --argjson start_slot "$start_slot" \
@@ -637,7 +626,7 @@ ensure_attester_duty() {
     --arg label "$label" \
     --argjson discovered_at "$discovered_at"
 
-  if (( ! already_exists )) && is_true "$AZMON_DUTY_INFO"; then
+  if is_true "$AZMON_DUTY_INFO"; then
     alert_once "duty-info" "$key" \
       "Duty info" \
       "$(html_field_line "kind" "attester")" \
@@ -715,7 +704,7 @@ poll_container_health() {
 }
 
 poll_docker_logs() {
-  local since cursor logs_output logs_error tmp_logs
+  local since cursor logs_error tmp_logs
   local line ts app_line severity last_ts next_cursor line_key
 
   cursor="$(state_get "docker_cursor.txt")"
@@ -735,8 +724,6 @@ poll_docker_logs() {
     return 1
   fi
 
-  logs_output="$(<"$tmp_logs")"
-  rm -f "$tmp_logs"
   last_ts=""
 
   while IFS= read -r line; do
@@ -767,7 +754,9 @@ poll_docker_logs() {
       "$(html_field_line "severity" "$severity")" \
       "$(html_field_line "container" "$AZMON_DOCKER_CONTAINER")" \
       "$(html_field_line "line" "$app_line")"
-  done <<<"$logs_output"
+  done <"$tmp_logs"
+
+  rm -f "$tmp_logs"
 
   if [[ -n "$last_ts" ]]; then
     state_put "docker_cursor.txt" "$last_ts"
@@ -860,12 +849,36 @@ record_checkpoint() {
   local proposer="$6"
   local signers_status="$7"
   local signers_json="$8"
-  local now
+  local now checkpoint_key slot_key
   now="$(now_epoch)"
+  checkpoint_key="checkpoint:$checkpoint"
+  slot_key="proposal-slot:$slot"
 
   json_put "completion_cache.json" \
-    '.[$key] = {type:"checkpoint", checkpoint:$checkpoint, slot:$slot, epoch:$epoch, slot_time:$slot_time, tx_hash:$tx_hash, proposer:$proposer, signers_status:$signers_status, signers:$signers, invalidated:false, updated_at:$now}' \
-    --arg key "checkpoint:$checkpoint" \
+    '.[$checkpoint_key] = {
+      type:"checkpoint",
+      checkpoint:$checkpoint,
+      slot:$slot,
+      epoch:$epoch,
+      slot_time:$slot_time,
+      tx_hash:$tx_hash,
+      proposer:$proposer,
+      signers_status:$signers_status,
+      signers:$signers,
+      invalidated:false,
+      updated_at:$now
+    } |
+    .[$slot_key] = {
+      type:"proposal-slot",
+      slot:$slot,
+      checkpoint:$checkpoint,
+      proposer:$proposer,
+      tx_hash:$tx_hash,
+      invalidated:false,
+      updated_at:$now
+    }' \
+    --arg checkpoint_key "$checkpoint_key" \
+    --arg slot_key "$slot_key" \
     --arg checkpoint "$checkpoint" \
     --argjson slot "$slot" \
     --argjson epoch "$epoch" \
@@ -875,15 +888,15 @@ record_checkpoint() {
     --arg signers_status "$signers_status" \
     --argjson signers "$signers_json" \
     --argjson now "$now"
+}
+
+mark_completion_invalidated() {
+  local key="$1"
 
   json_put "completion_cache.json" \
-    '.[$key] = {type:"proposal-slot", slot:$slot, checkpoint:$checkpoint, proposer:$proposer, tx_hash:$tx_hash, invalidated:false, updated_at:$now}' \
-    --arg key "proposal-slot:$slot" \
-    --argjson slot "$slot" \
-    --arg checkpoint "$checkpoint" \
-    --arg proposer "$proposer" \
-    --arg tx_hash "$tx_hash" \
-    --argjson now "$now"
+    'if has($key) then .[$key].invalidated = true | .[$key].updated_at = $now else . end' \
+    --arg key "$key" \
+    --argjson now "$(now_epoch)"
 }
 
 record_attestation_result() {
@@ -930,6 +943,18 @@ record_attestation_result() {
     --argjson included "$included" \
     --arg tx_hash "$tx_hash" \
     --argjson now "$now"
+}
+
+record_unknown_checkpoint_result() {
+  local checkpoint="$1"
+  local epoch="$2"
+  local tx_hash="$3"
+  local slot="$4"
+  local slot_time="$5"
+  local proposer="$6"
+
+  record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
+  process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]'
 }
 
 process_attestations_for_checkpoint() {
@@ -1006,6 +1031,31 @@ mark_attester_epoch_result() {
     --argjson finalized_at "$finalized_at"
 }
 
+attester_epoch_stats() {
+  local epoch="$1"
+  local address="$2"
+
+  json_get "completion_cache.json" '
+    {
+      observed: ([to_entries[]
+        | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address)
+      ] | length),
+      included: ([to_entries[]
+        | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address)
+        | select((.value.included // false) or .value.status == "completed")
+      ] | length),
+      not_included: ([to_entries[]
+        | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address)
+        | select(((.value.included // false) != true) and (.value.status == "not-included" or .value.status == "missed"))
+      ] | length),
+      unknown: ([to_entries[]
+        | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address and .value.status == "unknown")
+      ] | length)
+    }' \
+    --argjson epoch "$epoch" \
+    --arg address "$address"
+}
+
 check_attester_epoch_results() {
   local entry epoch address end_time finalized_at
   local stats_json observed included not_included unknown
@@ -1027,25 +1077,7 @@ check_attester_epoch_results() {
       continue
     fi
 
-    stats_json="$(json_get "completion_cache.json" '
-      {
-        observed: ([to_entries[]
-          | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address)
-        ] | length),
-        included: ([to_entries[]
-          | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address)
-          | select((.value.included // false) or .value.status == "completed")
-        ] | length),
-        not_included: ([to_entries[]
-          | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address)
-          | select(((.value.included // false) != true) and (.value.status == "not-included" or .value.status == "missed"))
-        ] | length),
-        unknown: ([to_entries[]
-          | select(.value.type == "attestation" and .value.invalidated != true and .value.epoch == $epoch and .value.address == $address and .value.status == "unknown")
-        ] | length)
-      }' \
-      --argjson epoch "$epoch" \
-      --arg address "$address")"
+    stats_json="$(attester_epoch_stats "$epoch" "$address")"
 
     observed="$(jq -r '.observed' <<<"$stats_json")"
     included="$(jq -r '.included' <<<"$stats_json")"
@@ -1089,23 +1121,20 @@ try_decode_checkpoint_signers() {
 
   if ! trace_json="$(trace_tx "$tx_hash" 2>/dev/null)"; then
     notify_runtime_error "debug_traceTransaction" "trace failed" "$tx_hash"
-    record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
-    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]' || return 1
+    record_unknown_checkpoint_result "$checkpoint" "$epoch" "$tx_hash" "$slot" "$slot_time" "$proposer" || return 1
     return 1
   fi
 
   propose_input="$(find_nested_rollup_propose_input "$trace_json")"
   if [[ -z "$propose_input" ]]; then
     notify_runtime_error "decode_rollup_propose_signers" "nested propose call not found in trace" "$tx_hash"
-    record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
-    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]' || return 1
+    record_unknown_checkpoint_result "$checkpoint" "$epoch" "$tx_hash" "$slot" "$slot_time" "$proposer" || return 1
     return 1
   fi
 
   if ! propose_signers="$(decode_rollup_propose_signers "$propose_input" 2>/dev/null)"; then
     notify_runtime_error "decode_rollup_propose_signers" "failed to decode propose calldata" "$tx_hash"
-    record_checkpoint "$checkpoint" "$slot" "$epoch" "$slot_time" "$tx_hash" "$proposer" "unknown" '[]'
-    process_attestations_for_checkpoint "$checkpoint" "$epoch" "$tx_hash" "unknown" '[]' || return 1
+    record_unknown_checkpoint_result "$checkpoint" "$epoch" "$tx_hash" "$slot" "$slot_time" "$proposer" || return 1
     return 1
   fi
 
@@ -1173,14 +1202,10 @@ process_checkpoint_invalidated_log() {
   slot="$(json_get "completion_cache.json" '.[$key].slot // empty' --arg key "checkpoint:$checkpoint")"
   proposer="$(json_get "completion_cache.json" '.[$key].proposer // empty' --arg key "checkpoint:$checkpoint")"
 
-  json_put "completion_cache.json" 'if has($key) then .[$key].invalidated = true | .[$key].updated_at = $now else . end' \
-    --arg key "checkpoint:$checkpoint" \
-    --argjson now "$(now_epoch)"
+  mark_completion_invalidated "checkpoint:$checkpoint"
 
   if [[ -n "$slot" ]]; then
-    json_put "completion_cache.json" 'if has($key) then .[$key].invalidated = true | .[$key].updated_at = $now else . end' \
-      --arg key "proposal-slot:$slot" \
-      --argjson now "$(now_epoch)"
+    mark_completion_invalidated "proposal-slot:$slot"
   fi
 
   json_put "completion_cache.json" \
@@ -1253,6 +1278,11 @@ check_for_missed_proposals() {
   done < <(json_get "duty_cache.json" 'to_entries[] | select(.value.type == "proposer")')
 }
 
+reconcile_pending_completions() {
+  retry_unknown_checkpoints
+  check_for_missed_proposals
+}
+
 poll_l1_completions() {
   local latest_block confirmed_block cursor from_block proposed_logs invalidated_logs
   local entry
@@ -1275,8 +1305,7 @@ poll_l1_completions() {
 
   from_block=$(( cursor + 1 ))
   if (( from_block > confirmed_block )); then
-    retry_unknown_checkpoints
-    check_for_missed_proposals
+    reconcile_pending_completions
     runtime_mark "last_l1_poll"
     return 0
   fi
@@ -1300,8 +1329,7 @@ poll_l1_completions() {
     process_checkpoint_invalidated_log "$entry" || true
   done < <(jq -c '.[]' <<<"$invalidated_logs")
 
-  retry_unknown_checkpoints
-  check_for_missed_proposals
+  reconcile_pending_completions
   check_attester_epoch_results
   state_put "l1_block_cursor.txt" "$confirmed_block"
   runtime_mark "last_l1_poll"
