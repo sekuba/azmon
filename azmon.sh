@@ -561,6 +561,8 @@ ensure_state_layout() {
   [[ -f "$file" ]] || : >"$file"
   file="$(state_file "l1_block_cursor.txt")"
   [[ -f "$file" ]] || : >"$file"
+  file="$(state_file "proposer_epoch_cursor.txt")"
+  [[ -f "$file" ]] || : >"$file"
 }
 
 validate_env() {
@@ -687,6 +689,44 @@ mark_proposer_status() {
     --argjson now "$(now_epoch)"
 }
 
+schedule_current_epoch_proposer_duties() {
+  local epoch="$1"
+  local slot_start="$2"
+  local slot_end="$3"
+  local epoch_start_time="$4"
+  local slot_duration="$5"
+  local epoch_members="$6"
+  local scheduled_epoch now slot slot_time proposer
+
+  scheduled_epoch="$(state_get "proposer_epoch_cursor.txt")"
+  if [[ "$scheduled_epoch" == "$epoch" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$epoch_members" ]]; then
+    state_put "proposer_epoch_cursor.txt" "$epoch"
+    return 0
+  fi
+
+  now="$(now_epoch)"
+
+  for ((slot = slot_start; slot <= slot_end; slot++)); do
+    slot_time=$(( epoch_start_time + ((slot - slot_start) * slot_duration) ))
+    if (( slot_time < now )); then
+      continue
+    fi
+    if ! proposer="$(get_proposer_at_time "$slot_time" 2>/dev/null)"; then
+      notify_runtime_error "getProposerAt" "failed to fetch proposer for slot $slot"
+      return 1
+    fi
+    if [[ -n "${MONITORED_SET[$proposer]:-}" ]]; then
+      ensure_proposer_duty "$epoch" "$slot" "$slot_time" "$proposer"
+    fi
+  done
+
+  state_put "proposer_epoch_cursor.txt" "$epoch"
+}
+
 poll_container_health() {
   local running
   if ! running="$(docker inspect --format '{{.State.Running}}' "$AZMON_DOCKER_CONTAINER" 2>&1)"; then
@@ -769,7 +809,7 @@ poll_docker_logs() {
 
 poll_upcoming_duties() {
   local current_epoch validator_lag randao_lag epoch_duration slot_duration stable_epoch_limit min_lag
-  local epoch slot_start slot_end epoch_start_time epoch_end_time slot slot_time proposer
+  local epoch slot_start slot_end epoch_start_time epoch_end_time
   local address epoch_members
 
   if ! current_epoch="$(get_current_epoch 2>/dev/null)"; then
@@ -819,22 +859,10 @@ poll_upcoming_duties() {
       ensure_attester_duty "$epoch" "$address" "$slot_start" "$slot_end" "$epoch_start_time" "$epoch_end_time"
     done <<<"$epoch_members"
 
-    for ((slot = slot_start; slot <= slot_end; slot++)); do
-      if ! slot_time="$(get_timestamp_for_slot "$slot" 2>/dev/null)"; then
-        notify_runtime_error "getTimestampForSlot" "failed to fetch timestamp for slot $slot"
-        return 1
-      fi
-      if (( slot_time < $(now_epoch) )); then
-        continue
-      fi
-      if ! proposer="$(get_proposer_at_time "$slot_time" 2>/dev/null)"; then
-        notify_runtime_error "getProposerAt" "failed to fetch proposer for slot $slot"
-        return 1
-      fi
-      if [[ -n "${MONITORED_SET[$proposer]:-}" ]]; then
-        ensure_proposer_duty "$epoch" "$slot" "$slot_time" "$proposer"
-      fi
-    done
+    if (( epoch == current_epoch )); then
+      # getProposerAt(Timestamp) is only reliable for the current epoch.
+      schedule_current_epoch_proposer_duties "$epoch" "$slot_start" "$slot_end" "$epoch_start_time" "$slot_duration" "$epoch_members" || return 1
+    fi
   done
 
   runtime_mark "last_duty_poll"

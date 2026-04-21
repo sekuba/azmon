@@ -34,6 +34,7 @@ State is stored under `AZMON_STATE_DIR` and includes:
 
 - `docker_cursor.txt`
 - `l1_block_cursor.txt`
+- `proposer_epoch_cursor.txt`
 - `duty_cache.json`
 - `completion_cache.json`
 - `alert_dedupe.json`
