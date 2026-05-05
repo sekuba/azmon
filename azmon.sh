@@ -696,7 +696,9 @@ schedule_current_epoch_proposer_duties() {
   local epoch_start_time="$4"
   local slot_duration="$5"
   local epoch_members="$6"
-  local scheduled_epoch now slot slot_time proposer
+  local scheduled_epoch now slot slot_time proposer address
+  local attester_count=0 proposer_count=0 duties="attester"
+  local epoch_end_time
 
   scheduled_epoch="$(state_get "proposer_epoch_cursor.txt")"
   if [[ "$scheduled_epoch" == "$epoch" ]]; then
@@ -709,6 +711,12 @@ schedule_current_epoch_proposer_duties() {
   fi
 
   now="$(now_epoch)"
+  epoch_end_time=$(( epoch_start_time + ((slot_end - slot_start + 1) * slot_duration) - 1 ))
+
+  while IFS= read -r address; do
+    [[ -n "$address" ]] || continue
+    attester_count=$(( attester_count + 1 ))
+  done <<<"$epoch_members"
 
   for ((slot = slot_start; slot <= slot_end; slot++)); do
     slot_time=$(( epoch_start_time + ((slot - slot_start) * slot_duration) ))
@@ -720,9 +728,15 @@ schedule_current_epoch_proposer_duties() {
       return 1
     fi
     if [[ -n "${MONITORED_SET[$proposer]:-}" ]]; then
+      proposer_count=$(( proposer_count + 1 ))
       ensure_proposer_duty "$epoch" "$slot" "$slot_time" "$proposer"
     fi
   done
+
+  if (( proposer_count > 0 )); then
+    duties="attester+proposer"
+  fi
+  log_info "current epoch $epoch monitored committee duties=$duties attesters=$attester_count proposer_slots=$proposer_count start=$(format_utc "$epoch_start_time") end=$(format_utc "$epoch_end_time")"
 
   state_put "proposer_epoch_cursor.txt" "$epoch"
 }
